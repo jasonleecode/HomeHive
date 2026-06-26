@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>登录 - HomeHive</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    <div class="login-page">
+        <div class="login-box">
+            <h1>🐝 HomeHive</h1>
+            <p>照片 · 视频 · 音频 · 文件 一站式管理</p>
+            <input type="text" id="username" placeholder="用户名" value="admin" autocomplete="username">
+            <input type="password" id="password" placeholder="密码" value="admin123" autocomplete="current-password">
+            <button onclick="login()">登录</button>
+            <div class="login-error" id="error"></div>
+        </div>
+    </div>
+
+    <script>
+        async function login() {
+            const username = document.getElementById('username').value.trim();
+            const password = document.getElementById('password').value;
+            const errorEl = document.getElementById('error');
+
+            try {
+                const res = await fetch('/api/auth/login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ username, password })
+                });
+                const data = await res.json();
+                if (data.success) {
+                    window.location.href = '/';
+                } else {
+                    errorEl.textContent = data.message || '登录失败';
+                }
+            } catch (e) {
+                errorEl.textContent = '网络错误，请重试';
+            }
+        }
+
+        document.getElementById('password').addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') login();
+        });
+    </script>
+</body>
+</html>

@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HomeHive · 家庭媒体管理平台</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    <div class="app-container" id="app">
+        <aside class="sidebar">
+            <div class="sidebar-header">
+                <h1>🐝 HomeHive</h1>
+                <p>您的私有云存储中心</p>
+            </div>
+            <ul class="nav-menu">
+                <li class="active" data-view="files" onclick="app.switchView('files')">
+                    <span class="icon">📁</span><span>文件管理</span>
+                </li>
+                <li data-view="photos" onclick="app.switchView('photos')">
+                    <span class="icon">🖼️</span><span>照片管理</span>
+                </li>
+                <li data-view="videos" onclick="app.switchView('videos')">
+                    <span class="icon">🎬</span><span>视频管理</span>
+                </li>
+                <li data-view="audios" onclick="app.switchView('audios')">
+                    <span class="icon">🎵</span><span>音频管理</span>
+                </li>
+                <li data-view="search" onclick="app.switchView('search')">
+                    <span class="icon">🔍</span><span>搜索</span>
+                </li>
+                <li data-view="stats" onclick="app.switchView('stats')">
+                    <span class="icon">📊</span><span>存储统计</span>
+                </li>
+                <li data-view="disks" onclick="app.switchView('disks')">
+                    <span class="icon">💾</span><span>磁盘管理</span>
+                </li>
+            </ul>
+            <div class="sidebar-footer">
+                <div>当前用户: <span id="current-user">-</span></div>
+                <button onclick="app.logout()">退出登录</button>
+            </div>
+        </aside>
+
+        <main class="main-content">
+            <header class="topbar">
+                <h2 id="page-title">文件管理</h2>
+                <div class="topbar-actions">
+                    <div class="search-box" id="global-search">
+                        <span class="icon">🔍</span>
+                        <input type="text" id="search-input" placeholder="搜索文件..." onkeydown="if(event.key==='Enter') app.doSearch()">
+                    </div>
+                    <button class="btn btn-secondary" onclick="app.scanStorage()" title="重新扫描文件">🔄 扫描</button>
+                    <button class="btn btn-primary" id="upload-btn" onclick="app.openUploadModal()">⬆️ 上传</button>
+                    <button class="btn btn-secondary" id="mkdir-btn" onclick="app.openMkdirModal()">📂 新建文件夹</button>
+                </div>
+            </header>
+
+            <div class="content-area" id="content-area">
+                <!-- 动态内容 -->
+            </div>
+        </main>
+
+        <!-- 音频播放器 -->
+        <div class="audio-player-bar hidden" id="audio-player">
+            <div class="audio-cover">🎵</div>
+            <div class="audio-info">
+                <div class="title" id="audio-title">未播放</div>
+                <div class="meta" id="audio-meta">-</div>
+            </div>
+            <div class="audio-controls">
+                <button onclick="app.audioPrev()">⏮</button>
+                <button onclick="app.audioToggle()" id="audio-play-btn">▶️</button>
+                <button onclick="app.audioNext()">⏭</button>
+            </div>
+            <audio id="audio-element" controls style="flex:2; max-width: 500px;"></audio>
+        </div>
+    </div>
+
+    <script src="/static/js/app.js"></script>
+</body>
+</html>

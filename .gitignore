@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# 运行时数据（数据库、用户文件、缩略图缓存）
+data/
+
+# 依赖
+node_modules/
+
+# 编辑器 / 系统
+.DS_Store
+.idea/
+.vscode/
+*.log
