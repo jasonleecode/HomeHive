@@ -62,6 +62,28 @@ class User(db.Model):
     created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
 
 
+class LibraryPath(db.Model):
+    """外部媒体库路径"""
+    __tablename__ = 'library_paths'
+
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(255), nullable=False)
+    path = db.Column(db.String(1024), nullable=False, unique=True, index=True)
+    enabled = db.Column(db.Boolean, default=True)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+    last_scan = db.Column(db.DateTime)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'name': self.name,
+            'path': self.path,
+            'enabled': self.enabled,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'last_scan': self.last_scan.isoformat() if self.last_scan else None,
+        }
+
+
 def compute_checksum(filepath):
     """计算文件 SHA256 校验和"""
     h = hashlib.sha256()

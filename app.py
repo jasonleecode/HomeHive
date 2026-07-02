@@ -1,7 +1,10 @@
 import os
-import json
 import shutil
 import secrets
+import subprocess
+import threading
+import time
+import uuid
 from functools import wraps
 from pathlib import Path
 from datetime import datetime, timezone
@@ -15,7 +18,7 @@ from config import (
     DATABASE_PATH, STORAGE_DIR, THUMBNAIL_DIR, MAX_CONTENT_LENGTH,
     SECRET_KEY, DEFAULT_USERNAME, DEFAULT_PASSWORD, ensure_dirs
 )
-from models import db, FileItem, User, compute_checksum
+from models import db, FileItem, User, LibraryPath, compute_checksum
 from utils import (
     safe_path, rel_path_from_abs, get_mime_type, guess_category,
     generate_thumbnail, extract_image_info, format_file_size, format_duration,
@@ -25,10 +28,19 @@ from utils import (
 app = Flask(__name__, static_folder='static', template_folder='templates')
 app.config['SQLALCHEMY_DATABASE_URI'] = f'sqlite:///{DATABASE_PATH}'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {'connect_args': {'timeout': 30}}
 app.config['MAX_CONTENT_LENGTH'] = MAX_CONTENT_LENGTH
 app.config['SECRET_KEY'] = SECRET_KEY
 
 db.init_app(app)
+
+SCAN_JOBS = {}
+SCAN_LOCK = threading.Lock()
+DB_WRITE_LOCK = threading.Lock()
+
+
+class ScanCancelled(Exception):
+    pass
 
 
 def login_required(f):
@@ -50,12 +62,206 @@ def init_default_user():
         )
         db.session.add(user)
         db.session.commit()
-        print(f"Default user created: {DEFAULT_USERNAME} / {DEFAULT_PASSWORD}")
+        print(f"Default user created: {DEFAULT_USERNAME}")
+
+
+def cleanup_misclassified_items():
+    updated = FileItem.query.filter(
+        FileItem.category == 'video',
+        FileItem.name.ilike('%.ts')
+    ).update({
+        FileItem.category: 'document',
+        FileItem.mime_type: 'text/plain',
+        FileItem.thumbnail: None,
+    }, synchronize_session=False)
+    if updated:
+        db.session.commit()
+        print(f"Fixed {updated} misclassified .ts items")
+
+
+def is_storage_root(path):
+    return Path(path).resolve() == Path(STORAGE_DIR).resolve()
+
+
+def require_non_root_path(path):
+    if is_storage_root(path):
+        raise ValueError('不允许对根存储目录执行此操作')
+
+
+def validate_child_name(name):
+    safe_name = secure_filename(name)
+    if not safe_name:
+        safe_name = name.replace('/', '_').replace('\\', '_').strip()
+    if not safe_name or safe_name in ('.', '..'):
+        raise ValueError('名称无效')
+    return safe_name
+
+
+def library_prefix(library_id):
+    return f'library/{library_id}/'
+
+
+def rel_path_from_library(abs_path, library):
+    root = Path(library.path).resolve()
+    target = Path(abs_path).resolve()
+    rel = target.relative_to(root).as_posix()
+    return library_prefix(library.id) + rel
+
+
+def resolve_media_path(rel_path):
+    if rel_path.startswith('library/'):
+        item = FileItem.query.filter_by(rel_path=rel_path).first()
+        if not item:
+            raise FileNotFoundError('文件不存在')
+
+        parts = rel_path.split('/', 2)
+        if len(parts) != 3 or not parts[1].isdigit():
+            raise ValueError('Invalid library path')
+
+        library = db.session.get(LibraryPath, int(parts[1]))
+        if not library or not library.enabled:
+            raise FileNotFoundError('媒体库不存在')
+
+        root = Path(library.path).resolve()
+        target = Path(item.path).resolve()
+        target.relative_to(root)
+        return target
+
+    return safe_path(rel_path)
+
+
+def update_scan_job(job_id, **updates):
+    if not job_id:
+        return
+    with SCAN_LOCK:
+        job = SCAN_JOBS.get(job_id)
+        if not job:
+            return
+        job.update(updates)
+        job['updated_at'] = datetime.now(timezone.utc).isoformat()
+
+
+def get_scan_job(job_id):
+    with SCAN_LOCK:
+        job = SCAN_JOBS.get(job_id)
+        return dict(job) if job else None
+
+
+def get_active_scan_job_for_library(library_id):
+    with SCAN_LOCK:
+        for job in SCAN_JOBS.values():
+            if job.get('library_id') == library_id and job.get('status') in ('queued', 'running'):
+                return dict(job)
+    return None
+
+
+def is_scan_cancel_requested(job_id):
+    if not job_id:
+        return False
+    with SCAN_LOCK:
+        job = SCAN_JOBS.get(job_id)
+        return bool(job and job.get('status') in ('cancelling', 'cancelled'))
+
+
+def cancel_scan_job(job_id, message='正在中止扫描'):
+    with SCAN_LOCK:
+        job = SCAN_JOBS.get(job_id)
+        if not job:
+            return None
+        if job.get('status') in ('done', 'failed', 'cancelled'):
+            return dict(job)
+        job['status'] = 'cancelling'
+        job['message'] = message
+        job['updated_at'] = datetime.now(timezone.utc).isoformat()
+        return dict(job)
+
+
+def cancel_scan_jobs_for_library(library_id, message='媒体库已移除，正在中止扫描'):
+    jobs = []
+    with SCAN_LOCK:
+        for job in SCAN_JOBS.values():
+            if job.get('library_id') == library_id and job.get('status') in ('queued', 'running', 'cancelling'):
+                job['status'] = 'cancelling'
+                job['message'] = message
+                job['updated_at'] = datetime.now(timezone.utc).isoformat()
+                jobs.append(dict(job))
+    return jobs
+
+
+def start_library_scan(library_id):
+    active = get_active_scan_job_for_library(library_id)
+    if active:
+        return active['id']
+
+    job_id = uuid.uuid4().hex
+    now = datetime.now(timezone.utc).isoformat()
+    with SCAN_LOCK:
+        SCAN_JOBS[job_id] = {
+            'id': job_id,
+            'library_id': library_id,
+            'status': 'queued',
+            'visited': 0,
+            'indexed': 0,
+            'skipped': 0,
+            'message': '等待扫描',
+            'started_at': now,
+            'updated_at': now,
+            'finished_at': None,
+        }
+
+    thread = threading.Thread(target=run_library_scan_job, args=(job_id, library_id), daemon=True)
+    thread.start()
+    return job_id
+
+
+def run_library_scan_job(job_id, library_id):
+    with app.app_context():
+        try:
+            library = db.session.get(LibraryPath, library_id)
+            if not library:
+                raise FileNotFoundError('媒体库不存在')
+            update_scan_job(job_id, status='running', message='正在扫描')
+            scanned = scan_library(library, job_id=job_id)
+            update_scan_job(
+                job_id,
+                status='done',
+                indexed=scanned,
+                message='扫描完成',
+                finished_at=datetime.now(timezone.utc).isoformat()
+            )
+        except ScanCancelled:
+            update_scan_job(
+                job_id,
+                status='cancelled',
+                message='扫描已中止',
+                current_path=None,
+                finished_at=datetime.now(timezone.utc).isoformat()
+            )
+        except Exception as e:
+            update_scan_job(
+                job_id,
+                status='failed',
+                message=str(e),
+                finished_at=datetime.now(timezone.utc).isoformat()
+            )
+        finally:
+            db.session.remove()
 
 
 @app.before_request
 def check_session():
-    pass
+    if request.method in ('GET', 'HEAD', 'OPTIONS'):
+        return None
+    if request.endpoint == 'api_login':
+        return None
+    if not session.get('logged_in'):
+        return None
+
+    expected = session.get('csrf_token')
+    supplied = request.headers.get('X-CSRF-Token')
+    if not expected or not secrets.compare_digest(expected, supplied or ''):
+        return jsonify({'success': False, 'message': 'CSRF token 无效'}), 403
+    return None
 
 
 # ============================================================
@@ -106,7 +312,8 @@ def api_logout():
 def api_auth_status():
     return jsonify({
         'logged_in': session.get('logged_in', False),
-        'username': session.get('username')
+        'username': session.get('username'),
+        'csrf_token': session.get('csrf_token') if session.get('logged_in') else None
     })
 
 
@@ -162,11 +369,8 @@ def api_mkdir():
     if not name:
         return jsonify({'success': False, 'message': '目录名称不能为空'}), 400
     
-    safe_name = secure_filename(name)
-    if not safe_name:
-        safe_name = name.replace('/', '_').replace('\\', '_')
-    
     try:
+        safe_name = validate_child_name(name)
         parent = safe_path(path)
         new_dir = parent / safe_name
         new_dir.mkdir(parents=True, exist_ok=True)
@@ -196,9 +400,11 @@ def api_upload():
     for file in files:
         if not file.filename:
             continue
-        safe_name = secure_filename(file.filename)
-        if not safe_name:
-            safe_name = file.filename.replace('/', '_').replace('\\', '_')
+        try:
+            safe_name = validate_child_name(file.filename)
+        except ValueError as e:
+            results.append({'success': False, 'name': file.filename, 'message': str(e)})
+            continue
         
         dest = target_dir / safe_name
         counter = 1
@@ -231,9 +437,9 @@ def api_rename():
     
     try:
         old_path = safe_path(rel_path)
-        new_path = old_path.parent / secure_filename(new_name)
-        if not new_path.name:
-            new_path = old_path.parent / new_name.replace('/', '_').replace('\\', '_')
+        require_non_root_path(old_path)
+        safe_name = validate_child_name(new_name)
+        new_path = old_path.parent / safe_name
         
         if new_path.exists():
             return jsonify({'success': False, 'message': '目标已存在'}), 400
@@ -257,8 +463,11 @@ def api_move():
     try:
         src_path = safe_path(source)
         dst_dir = safe_path(target)
+        require_non_root_path(src_path)
         if not dst_dir.is_dir():
             return jsonify({'success': False, 'message': '目标目录不存在'}), 404
+        if src_path.is_dir() and dst_dir.resolve().is_relative_to(src_path.resolve()):
+            return jsonify({'success': False, 'message': '不能移动目录到自身或子目录'}), 400
         
         dst_path = dst_dir / src_path.name
         if dst_path.exists():
@@ -281,6 +490,7 @@ def api_delete():
     
     try:
         target = safe_path(rel_path)
+        require_non_root_path(target)
         if not target.exists():
             return jsonify({'success': False, 'message': '文件不存在'}), 404
         
@@ -406,13 +616,19 @@ def api_scan():
 @app.route('/api/thumbnail/<path:rel_path>')
 @login_required
 def api_thumbnail(rel_path):
-    thumb_path = Path(THUMBNAIL_DIR) / (rel_path + '.jpg')
+    thumb_base = Path(THUMBNAIL_DIR).resolve()
+    thumb_path = (thumb_base / (rel_path + '.jpg')).resolve()
+    try:
+        thumb_path.relative_to(thumb_base)
+    except ValueError:
+        return jsonify({'success': False, 'message': 'Invalid path: directory traversal detected'}), 400
+
     if thumb_path.exists():
         return send_file(str(thumb_path), mimetype='image/jpeg')
     
     # 没有缩略图则尝试原图
     try:
-        target = safe_path(rel_path)
+        target = resolve_media_path(rel_path)
         if target.is_file() and is_image_file(target.name):
             return send_file(str(target))
     except Exception:
@@ -425,7 +641,7 @@ def api_thumbnail(rel_path):
 @login_required
 def api_preview(rel_path):
     try:
-        target = safe_path(rel_path)
+        target = resolve_media_path(rel_path)
         if not target.is_file():
             return jsonify({'success': False, 'message': '文件不存在'}), 404
         
@@ -433,19 +649,78 @@ def api_preview(rel_path):
         return send_file(str(target), mimetype=mime)
     except ValueError as e:
         return jsonify({'success': False, 'message': str(e)}), 400
+    except FileNotFoundError as e:
+        return jsonify({'success': False, 'message': str(e)}), 404
     except Exception as e:
         return jsonify({'success': False, 'message': f'预览失败: {str(e)}'}), 500
+
+
+@app.route('/api/transcode/<path:rel_path>')
+@login_required
+def api_transcode(rel_path):
+    """将浏览器可能不支持的视频临时转为 H.264/AAC fragmented MP4 流"""
+    try:
+        target = resolve_media_path(rel_path)
+        if not target.is_file():
+            return jsonify({'success': False, 'message': '文件不存在'}), 404
+        if guess_category(target.name) != 'video':
+            return jsonify({'success': False, 'message': '不是视频文件'}), 400
+        if not shutil.which('ffmpeg'):
+            return jsonify({'success': False, 'message': 'ffmpeg 未安装，无法转码播放'}), 500
+
+        cmd = [
+            'ffmpeg',
+            '-hide_banner',
+            '-loglevel', 'error',
+            '-i', str(target),
+            '-map', '0:v:0',
+            '-map', '0:a?',
+            '-c:v', 'libx264',
+            '-preset', 'veryfast',
+            '-tune', 'zerolatency',
+            '-pix_fmt', 'yuv420p',
+            '-c:a', 'aac',
+            '-b:a', '160k',
+            '-movflags', 'frag_keyframe+empty_moov+faststart',
+            '-f', 'mp4',
+            'pipe:1',
+        ]
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+        def generate():
+            try:
+                while True:
+                    chunk = proc.stdout.read(1024 * 256)
+                    if not chunk:
+                        break
+                    yield chunk
+            finally:
+                if proc.poll() is None:
+                    proc.terminate()
+
+        return Response(generate(), mimetype='video/mp4', headers={
+            'Cache-Control': 'no-store',
+            'X-Accel-Buffering': 'no',
+        })
+    except FileNotFoundError as e:
+        return jsonify({'success': False, 'message': str(e)}), 404
+    except ValueError as e:
+        return jsonify({'success': False, 'message': str(e)}), 400
+    except Exception as e:
+        return jsonify({'success': False, 'message': f'转码失败: {str(e)}'}), 500
 
 
 # ============================================================
 # 索引与扫描工具
 # ============================================================
 
-def sync_single_file(abs_path):
+def sync_single_file(abs_path, rel_path=None, cancel_check=None):
     """同步单个文件/目录到数据库"""
-    rel = rel_path_from_abs(abs_path)
+    rel = rel_path or rel_path_from_abs(abs_path)
     if rel is None:
         return None
+    if cancel_check and cancel_check():
+        raise ScanCancelled()
     
     is_dir = abs_path.is_dir()
     stat = abs_path.stat() if abs_path.exists() else None
@@ -481,8 +756,20 @@ def sync_single_file(abs_path):
             thumb_rel = generate_thumbnail(str(abs_path), rel, 'video')
             item.thumbnail = thumb_rel
     
-    db.session.commit()
+    if cancel_check and cancel_check():
+        db.session.rollback()
+        raise ScanCancelled()
+    with DB_WRITE_LOCK:
+        if cancel_check and cancel_check():
+            db.session.rollback()
+            raise ScanCancelled()
+        db.session.commit()
     return item
+
+
+def sync_library_file(abs_path, library, job_id=None):
+    rel = rel_path_from_library(abs_path, library)
+    return sync_single_file(abs_path, rel, cancel_check=lambda: is_scan_cancel_requested(job_id))
 
 
 def remove_from_index(abs_path):
@@ -516,7 +803,8 @@ def update_path_index(old_abs, new_abs):
             item.name = new_abs.name
         else:
             item.rel_path = new_prefix + item.rel_path[len(old_prefix):]
-        item.path = str(STORAGE_DIR / item.rel_path)
+            item.name = Path(item.rel_path).name
+        item.path = str(Path(STORAGE_DIR) / item.rel_path)
     
     db.session.commit()
 
@@ -537,7 +825,7 @@ def scan_storage():
                 print(f"Scan error for {entry}: {e}")
     
     # 清理不存在的条目
-    for item in FileItem.query.all():
+    for item in FileItem.query.filter(~FileItem.rel_path.like('library/%')).all():
         abs_path = safe_path(item.rel_path)
         if not abs_path.exists():
             db.session.delete(item)
@@ -546,9 +834,267 @@ def scan_storage():
     return scanned
 
 
+def scan_library(library, job_id=None):
+    """扫描外部媒体库路径，并同步到数据库索引"""
+    root = Path(library.path).resolve()
+    if not root.is_dir():
+        raise ValueError('媒体库路径不存在或不是目录')
+
+    visited = 0
+    indexed = 0
+    skipped = 0
+    last_update = 0
+    for entry in root.rglob('*'):
+        if is_scan_cancel_requested(job_id):
+            db.session.rollback()
+            raise ScanCancelled()
+        if not entry.is_file():
+            continue
+        visited += 1
+        category = guess_category(entry.name)
+        if category == 'other':
+            skipped += 1
+            now = time.monotonic()
+            if job_id and now - last_update >= 0.5:
+                update_scan_job(
+                    job_id,
+                    visited=visited,
+                    indexed=indexed,
+                    skipped=skipped,
+                    current_path=str(entry),
+                    message='正在扫描'
+                )
+                last_update = now
+            continue
+        try:
+            sync_library_file(entry, library, job_id=job_id)
+            indexed += 1
+        except ScanCancelled:
+            raise
+        except Exception as e:
+            print(f"Library scan error for {entry}: {e}")
+            skipped += 1
+
+        now = time.monotonic()
+        if job_id and now - last_update >= 0.5:
+            update_scan_job(
+                job_id,
+                visited=visited,
+                indexed=indexed,
+                skipped=skipped,
+                current_path=str(entry),
+                message='正在扫描'
+            )
+            last_update = now
+
+    if is_scan_cancel_requested(job_id):
+        db.session.rollback()
+        raise ScanCancelled()
+
+    prefix = library_prefix(library.id)
+    for item in FileItem.query.filter(FileItem.rel_path.like(prefix + '%')).all():
+        if is_scan_cancel_requested(job_id):
+            db.session.rollback()
+            raise ScanCancelled()
+        try:
+            target = Path(item.path).resolve()
+            target.relative_to(root)
+            if not target.exists() or guess_category(target.name) == 'other':
+                db.session.delete(item)
+        except Exception:
+            db.session.delete(item)
+
+    library.last_scan = datetime.now(timezone.utc)
+    if is_scan_cancel_requested(job_id):
+        db.session.rollback()
+        raise ScanCancelled()
+    with DB_WRITE_LOCK:
+        if is_scan_cancel_requested(job_id):
+            db.session.rollback()
+            raise ScanCancelled()
+        db.session.commit()
+    update_scan_job(
+        job_id,
+        visited=visited,
+        indexed=indexed,
+        skipped=skipped,
+        current_path=None,
+        message='扫描完成'
+    )
+    return indexed
+
+
 # ============================================================
 # 磁盘管理 API
 # ============================================================
+
+@app.route('/api/libraries', methods=['GET'])
+@login_required
+def api_list_libraries():
+    libraries = LibraryPath.query.order_by(LibraryPath.created_at.desc()).all()
+    items = []
+    for library in libraries:
+        info = library.to_dict()
+        prefix = library_prefix(library.id)
+        info['file_count'] = FileItem.query.filter(FileItem.rel_path.like(prefix + '%')).count()
+        info['exists'] = Path(library.path).is_dir()
+        info['scan_job'] = get_active_scan_job_for_library(library.id)
+        items.append(info)
+    return jsonify({'success': True, 'items': items})
+
+
+@app.route('/api/libraries', methods=['POST'])
+@login_required
+def api_add_library():
+    data = request.get_json() or {}
+    raw_path = data.get('path', '').strip()
+    name = data.get('name', '').strip()
+
+    if not raw_path:
+        return jsonify({'success': False, 'message': '路径不能为空'}), 400
+
+    requested = Path(raw_path).expanduser()
+    if not requested.is_absolute():
+        return jsonify({'success': False, 'message': '请输入绝对路径'}), 400
+
+    target = requested.resolve()
+    if not target.is_dir():
+        return jsonify({'success': False, 'message': '路径不存在或不是目录'}), 400
+
+    normalized = str(target)
+    library = LibraryPath.query.filter_by(path=normalized).first()
+    if not library:
+        library = LibraryPath(
+            name=name or target.name or normalized,
+            path=normalized,
+            enabled=True
+        )
+        db.session.add(library)
+        with DB_WRITE_LOCK:
+            db.session.commit()
+    else:
+        library.name = name or library.name
+        library.enabled = True
+        with DB_WRITE_LOCK:
+            db.session.commit()
+
+    item = library.to_dict()
+    item['file_count'] = FileItem.query.filter(FileItem.rel_path.like(library_prefix(library.id) + '%')).count()
+    item['exists'] = True
+    job_id = start_library_scan(library.id)
+    return jsonify({'success': True, 'item': item, 'job_id': job_id})
+
+
+@app.route('/api/libraries/<int:library_id>/scan', methods=['POST'])
+@login_required
+def api_scan_library(library_id):
+    library = db.session.get(LibraryPath, library_id)
+    if not library:
+        return jsonify({'success': False, 'message': '媒体库不存在'}), 404
+
+    if not Path(library.path).is_dir():
+        return jsonify({'success': False, 'message': '媒体库路径不存在或不是目录'}), 400
+
+    job_id = start_library_scan(library.id)
+    return jsonify({'success': True, 'job_id': job_id})
+
+
+@app.route('/api/scan-jobs/<job_id>', methods=['GET'])
+@login_required
+def api_scan_job_status(job_id):
+    job = get_scan_job(job_id)
+    if not job:
+        return jsonify({'success': False, 'message': '扫描任务不存在'}), 404
+    return jsonify({'success': True, 'job': job})
+
+
+@app.route('/api/scan-jobs/<job_id>/cancel', methods=['POST'])
+@login_required
+def api_cancel_scan_job(job_id):
+    job = cancel_scan_job(job_id)
+    if not job:
+        return jsonify({'success': False, 'message': '扫描任务不存在'}), 404
+    return jsonify({'success': True, 'job': job})
+
+
+@app.route('/api/libraries/<int:library_id>', methods=['DELETE'])
+@login_required
+def api_delete_library(library_id):
+    library = db.session.get(LibraryPath, library_id)
+    if not library:
+        return jsonify({'success': False, 'message': '媒体库不存在'}), 404
+
+    cancel_scan_jobs_for_library(library.id)
+    library.enabled = False
+    prefix = library_prefix(library.id)
+    with DB_WRITE_LOCK:
+        db.session.flush()
+        FileItem.query.filter(FileItem.rel_path.like(prefix + '%')).delete(synchronize_session=False)
+        db.session.delete(library)
+        db.session.commit()
+
+    with SCAN_LOCK:
+        for job in SCAN_JOBS.values():
+            if job.get('library_id') == library_id and job.get('status') in ('queued', 'running', 'cancelling'):
+                job['status'] = 'cancelled'
+                job['message'] = '媒体库已移除，扫描已中止'
+                job['current_path'] = None
+                job['finished_at'] = datetime.now(timezone.utc).isoformat()
+                job['updated_at'] = job['finished_at']
+    return jsonify({'success': True})
+
+
+@app.route('/api/directories', methods=['GET'])
+@login_required
+def api_list_directories():
+    raw_path = request.args.get('path', '').strip()
+    target = Path(raw_path).expanduser() if raw_path else Path('/')
+    if not target.is_absolute():
+        return jsonify({'success': False, 'message': '请输入绝对路径'}), 400
+
+    try:
+        target = target.resolve()
+        if not target.is_dir():
+            return jsonify({'success': False, 'message': '目录不存在'}), 404
+
+        dirs = []
+        for entry in sorted(target.iterdir(), key=lambda e: e.name.lower()):
+            try:
+                if not entry.is_dir():
+                    continue
+                dirs.append({
+                    'name': entry.name,
+                    'path': str(entry.resolve()),
+                })
+            except (OSError, PermissionError):
+                continue
+
+        parent = target.parent if target.parent != target else None
+        return jsonify({
+            'success': True,
+            'path': str(target),
+            'parent': str(parent) if parent else None,
+            'dirs': dirs,
+        })
+    except PermissionError:
+        return jsonify({'success': False, 'message': '没有权限访问该目录'}), 403
+    except Exception as e:
+        return jsonify({'success': False, 'message': f'读取目录失败: {str(e)}'}), 500
+
+
+def should_show_partition(part):
+    device = part.device or ''
+    mountpoint = part.mountpoint or ''
+    fstype = (part.fstype or '').lower()
+
+    if device.startswith('/dev/loop'):
+        return False
+    if fstype in {'squashfs', 'tmpfs', 'devtmpfs', 'overlay', 'proc', 'sysfs', 'cgroup', 'cgroup2', 'autofs'}:
+        return False
+    if mountpoint.startswith(('/snap/', '/proc', '/sys', '/dev', '/run')):
+        return False
+    return True
+
 
 @app.route('/api/disks', methods=['GET'])
 @login_required
@@ -558,6 +1104,8 @@ def api_disks():
     
     disks = []
     for part in psutil.disk_partitions(all=show_all):
+        if not show_all and not should_show_partition(part):
+            continue
         try:
             usage = psutil.disk_usage(part.mountpoint)
             disks.append({
@@ -607,7 +1155,11 @@ with app.app_context():
     ensure_dirs()
     db.create_all()
     init_default_user()
+    cleanup_misclassified_items()
 
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    host = os.environ.get('HIVE_HOST', '127.0.0.1')
+    port = int(os.environ.get('HIVE_PORT', '5000'))
+    debug = os.environ.get('HIVE_DEBUG', '').lower() in ('1', 'true', 'yes', 'on')
+    app.run(host=host, port=port, debug=debug)

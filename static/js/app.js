@@ -7,6 +7,8 @@ const app = {
     audioPlaylist: [],
     audioIndex: 0,
     searchQuery: '',
+    csrfToken: '',
+    scanJobs: {},
     // Picasa 风格照片预览
     photoItems: [],
     lbIndex: 0,
@@ -22,12 +24,18 @@ const app = {
             window.location.href = '/login';
             return;
         }
+        this.csrfToken = status.csrf_token || '';
         document.getElementById('current-user').textContent = status.username || 'admin';
         this.switchView('files');
     },
 
     async api(url, options = {}) {
         try {
+            const method = (options.method || 'GET').toUpperCase();
+            if (!['GET', 'HEAD', 'OPTIONS'].includes(method) && this.csrfToken) {
+                options.headers = options.headers || {};
+                options.headers['X-CSRF-Token'] = this.csrfToken;
+            }
             const res = await fetch(url, options);
             if (res.status === 401) {
                 window.location.href = '/login';
@@ -427,15 +435,37 @@ const app = {
 
     openLightbox(relPath, type) {
         const url = `/api/preview/${this.encodePath(relPath)}`;
+        const transcodeUrl = `/api/transcode/${this.encodePath(relPath)}`;
         const overlay = document.createElement('div');
         overlay.className = 'lightbox';
         overlay.id = 'lightbox';
         overlay.innerHTML = `
             <span class="lightbox-close" onclick="app.closeLightbox()">&times;</span>
-            <video controls autoplay src="${url}"></video>
+            <div class="video-shell">
+                <video controls autoplay playsinline src="${url}" data-transcode-src="${transcodeUrl}"></video>
+                <div class="video-status" id="video-status"></div>
+            </div>
         `;
         overlay.onclick = (e) => { if (e.target === overlay) this.closeLightbox(); };
         document.body.appendChild(overlay);
+        const video = overlay.querySelector('video');
+        const status = overlay.querySelector('#video-status');
+        if (video) {
+            video.addEventListener('error', () => {
+                if (video.dataset.transcodeTried === '1') {
+                    if (status) status.textContent = '视频无法播放，请下载后使用本地播放器打开';
+                    return;
+                }
+                video.dataset.transcodeTried = '1';
+                if (status) status.textContent = '当前编码浏览器不支持，正在尝试转码播放...';
+                video.src = video.dataset.transcodeSrc;
+                video.load();
+                video.play().catch(() => {});
+            });
+            video.addEventListener('playing', () => {
+                if (status) status.textContent = '';
+            });
+        }
         this._lbEsc = (e) => { if (e.key === 'Escape') app.closeLightbox(); };
         document.addEventListener('keydown', this._lbEsc);
     },
@@ -821,11 +851,84 @@ const app = {
     // =====================================================
 
     async loadDisks() {
-        const data = await this.api('/api/disks');
+        const [data, libraries] = await Promise.all([
+            this.api('/api/disks'),
+            this.api('/api/libraries')
+        ]);
         if (!data.success) return;
         const container = document.getElementById('content-area');
 
-        let html = '<h3 style="margin-bottom:16px;">💾 磁盘分区</h3><div class="disk-grid">';
+        let html = `
+            <div class="library-panel">
+                <div class="library-header">
+                    <h3>媒体库路径</h3>
+                    <div class="library-form">
+                        <input type="text" id="library-path-input" placeholder="请选择要扫描的目录" readonly>
+                        <button class="btn btn-secondary" onclick="app.openDirectoryPicker()">选择路径</button>
+                        <button class="btn btn-primary" onclick="app.addLibraryPath()">添加并扫描</button>
+                    </div>
+                </div>
+                <div class="library-list">
+        `;
+
+        const libraryItems = libraries.success ? libraries.items : [];
+        if (!libraryItems.length) {
+            html += `
+                <div class="empty-state compact">
+                    <div class="icon">📂</div>
+                    <p>尚未添加媒体库路径</p>
+                </div>
+            `;
+        } else {
+            libraryItems.forEach(lib => {
+                if (lib.scan_job && !this.scanJobs[lib.id]) {
+                    this.scanJobs[lib.id] = lib.scan_job;
+                    setTimeout(() => this.pollScanJob(lib.id, lib.scan_job.id), 1000);
+                }
+                const existsLabel = lib.exists ? '可访问' : '不可访问';
+                const existsClass = lib.exists ? 'success' : 'danger';
+                const job = this.scanJobs[lib.id];
+                const scanning = job && ['queued', 'running', 'cancelling'].includes(job.status);
+                const progressText = job
+                    ? `${job.message || '-'} · 已处理 ${job.visited || 0} · 已索引 ${job.indexed || 0} · 已跳过 ${job.skipped || 0}`
+                    : '';
+                html += `
+                    <div class="library-item">
+                        <div class="library-main">
+                            <div class="library-name">${this.escapeHtml(lib.name)}</div>
+                            <div class="library-path" title="${this.escapeHtml(lib.path)}">${this.escapeHtml(lib.path)}</div>
+                            <div class="library-meta">
+                                <span>${lib.file_count || 0} 个文件</span>
+                                <span class="${existsClass}">${existsLabel}</span>
+                                <span>上次扫描: ${lib.last_scan ? this.formatDate(lib.last_scan) : '-'}</span>
+                            </div>
+                            ${job ? `
+                                <div class="library-scan-status ${job.status}">
+                                    <div class="library-scan-line">
+                                        <span>${this.escapeHtml(progressText)}</span>
+                                    </div>
+                                    ${job.current_path ? `<div class="library-current" title="${this.escapeHtml(job.current_path)}">${this.escapeHtml(job.current_path)}</div>` : ''}
+                                    ${scanning ? '<div class="library-progress"><div></div></div>' : ''}
+                                </div>
+                            ` : ''}
+                        </div>
+                        <div class="library-actions">
+                            <button class="btn btn-secondary" onclick="app.scanLibrary(${lib.id})" ${scanning ? 'disabled' : ''}>扫描</button>
+                            ${scanning ? `<button class="btn btn-secondary" onclick="app.cancelScanJob(${lib.id}, '${this.escapeJs(job.id)}')">中止</button>` : ''}
+                            <button class="btn btn-danger" onclick="app.deleteLibrary(${lib.id})">移除</button>
+                        </div>
+                    </div>
+                `;
+            });
+        }
+
+        html += `
+                </div>
+            </div>
+            <h3 style="margin:24px 0 16px;">💾 磁盘分区</h3>
+            <div class="disk-grid">
+        `;
+
         if (!data.disks || data.disks.length === 0) {
             html += `
                 <div class="empty-state" style="grid-column:1/-1;">
@@ -881,6 +984,188 @@ const app = {
         }
 
         container.innerHTML = html;
+    },
+
+    async openDirectoryPicker(startPath = '/') {
+        let picker = document.getElementById('directory-picker');
+        if (!picker) {
+            picker = document.createElement('div');
+            picker.className = 'modal-overlay';
+            picker.id = 'directory-picker';
+            picker.innerHTML = `
+                <div class="modal directory-modal">
+                    <div class="modal-header">
+                        <h3>选择媒体库路径</h3>
+                        <span class="close" onclick="app.closeDirectoryPicker()">&times;</span>
+                    </div>
+                    <div class="modal-body">
+                        <div class="directory-current" id="directory-current"></div>
+                        <div class="directory-list" id="directory-list"></div>
+                    </div>
+                    <div class="modal-footer">
+                        <button class="btn btn-secondary" onclick="app.closeDirectoryPicker()">取消</button>
+                        <button class="btn btn-primary" onclick="app.confirmDirectoryPicker()">选择此目录</button>
+                    </div>
+                </div>
+            `;
+            picker.onclick = (e) => { if (e.target === picker) this.closeDirectoryPicker(); };
+            document.body.appendChild(picker);
+        }
+        await this.loadDirectoryPicker(startPath);
+    },
+
+    closeDirectoryPicker() {
+        const picker = document.getElementById('directory-picker');
+        if (picker) picker.remove();
+    },
+
+    async loadDirectoryPicker(path) {
+        const current = document.getElementById('directory-current');
+        const list = document.getElementById('directory-list');
+        if (!current || !list) return;
+
+        current.textContent = path;
+        list.innerHTML = '<div class="spinner" style="margin:24px auto;"></div>';
+        const data = await this.api(`/api/directories?path=${encodeURIComponent(path)}`);
+        if (!data.success) {
+            list.innerHTML = `<div class="directory-error">${this.escapeHtml(data.message || '读取目录失败')}</div>`;
+            return;
+        }
+
+        this.selectedDirectoryPath = data.path;
+        current.textContent = data.path;
+        let html = '';
+        if (data.parent) {
+            html += `
+                <button class="directory-row" onclick="app.loadDirectoryPicker('${this.escapeJs(data.parent)}')">
+                    <span class="icon">↩</span>
+                    <span class="name">上一级</span>
+                </button>
+            `;
+        }
+        if (!data.dirs.length) {
+            html += '<div class="directory-empty">当前目录没有可进入的子目录</div>';
+        } else {
+            data.dirs.forEach(dir => {
+                html += `
+                    <button class="directory-row" onclick="app.loadDirectoryPicker('${this.escapeJs(dir.path)}')">
+                        <span class="icon">📁</span>
+                        <span class="name">${this.escapeHtml(dir.name)}</span>
+                    </button>
+                `;
+            });
+        }
+        list.innerHTML = html;
+    },
+
+    confirmDirectoryPicker() {
+        const input = document.getElementById('library-path-input');
+        if (input && this.selectedDirectoryPath) {
+            input.value = this.selectedDirectoryPath;
+        }
+        this.closeDirectoryPicker();
+    },
+
+    async addLibraryPath() {
+        const input = document.getElementById('library-path-input');
+        const path = input ? input.value.trim() : '';
+        if (!path) {
+            this.toast('请输入要扫描的路径', 'error');
+            return;
+        }
+
+        this.toast('正在添加并扫描媒体库...', 'info');
+        const data = await this.api('/api/libraries', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ path })
+        });
+
+        if (data.success) {
+            this.toast('已开始扫描媒体库', 'info');
+            if (data.job_id && data.item) {
+                this.trackScanJob(data.item.id, data.job_id);
+            }
+            this.loadDisks();
+        } else {
+            this.toast(data.message || '添加失败', 'error');
+        }
+    },
+
+    async scanLibrary(id) {
+        this.toast('已开始扫描媒体库', 'info');
+        const data = await this.api(`/api/libraries/${id}/scan`, { method: 'POST' });
+        if (data.success) {
+            if (data.job_id) {
+                this.trackScanJob(id, data.job_id);
+            }
+            this.loadDisks();
+        } else {
+            this.toast(data.message || '扫描失败', 'error');
+        }
+    },
+
+    trackScanJob(libraryId, jobId) {
+        this.scanJobs[libraryId] = {
+            id: jobId,
+            library_id: libraryId,
+            status: 'queued',
+            visited: 0,
+            indexed: 0,
+            skipped: 0,
+            message: '等待扫描'
+        };
+        this.pollScanJob(libraryId, jobId);
+    },
+
+    async pollScanJob(libraryId, jobId) {
+        const data = await this.api(`/api/scan-jobs/${jobId}`);
+        if (!data.success) return;
+
+        this.scanJobs[libraryId] = data.job;
+        if (this.currentView === 'disks') this.loadDisks();
+
+        if (['queued', 'running', 'cancelling'].includes(data.job.status)) {
+            setTimeout(() => this.pollScanJob(libraryId, jobId), 1000);
+        } else if (data.job.status === 'done') {
+            this.toast(`扫描完成，已索引 ${data.job.indexed || 0} 个文件`, 'success');
+            setTimeout(() => {
+                delete this.scanJobs[libraryId];
+                if (this.currentView === 'disks') this.loadDisks();
+            }, 5000);
+        } else if (data.job.status === 'cancelled') {
+            this.toast('扫描已中止', 'info');
+            setTimeout(() => {
+                delete this.scanJobs[libraryId];
+                if (this.currentView === 'disks') this.loadDisks();
+            }, 3000);
+        } else if (data.job.status === 'failed') {
+            this.toast(data.job.message || '扫描失败', 'error');
+        }
+    },
+
+    async cancelScanJob(libraryId, jobId) {
+        const data = await this.api(`/api/scan-jobs/${jobId}/cancel`, { method: 'POST' });
+        if (data.success) {
+            this.scanJobs[libraryId] = data.job;
+            this.toast('正在中止扫描...', 'info');
+            this.pollScanJob(libraryId, jobId);
+            this.loadDisks();
+        } else {
+            this.toast(data.message || '中止失败', 'error');
+        }
+    },
+
+    async deleteLibrary(id) {
+        if (!confirm('确定要移除此媒体库路径吗? 正在进行的扫描会被中止，原始文件不会被删除。')) return;
+        const data = await this.api(`/api/libraries/${id}`, { method: 'DELETE' });
+        if (data.success) {
+            delete this.scanJobs[id];
+            this.toast('媒体库已移除', 'success');
+            this.loadDisks();
+        } else {
+            this.toast(data.message || '移除失败', 'error');
+        }
     },
 
     // =====================================================

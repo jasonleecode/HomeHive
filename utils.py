@@ -1,4 +1,3 @@
-import os
 from pathlib import Path
 from PIL import Image, ExifTags
 import json
@@ -22,6 +21,10 @@ def guess_category(filename, mime_type=None):
     if not mime_type:
         mime_type, _ = mimetypes.guess_type(filename)
         mime_type = mime_type or 'application/octet-stream'
+
+    # .ts 更常见于 TypeScript/CMake 依赖文件；避免把源码误归类为视频。
+    if ext == 'ts':
+        return 'document'
     
     if mime_type.startswith('image/') or ext in ALLOWED_EXTENSIONS['image']:
         return 'image'
@@ -39,7 +42,9 @@ def safe_path(rel_path):
     """将相对路径转换为绝对路径，并防止目录穿越"""
     base = Path(STORAGE_DIR).resolve()
     target = (base / rel_path).resolve()
-    if not str(target).startswith(str(base)):
+    try:
+        target.relative_to(base)
+    except ValueError:
         raise ValueError('Invalid path: directory traversal detected')
     return target
 

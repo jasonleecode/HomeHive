@@ -10,6 +10,7 @@
 - 🎵 **音频管理**：音乐库、底部播放器、播放列表、上一首/下一首
 - 🔍 **全局搜索**：按文件名快速搜索
 - 📊 **存储统计**：按分类统计文件数量和占用空间
+- 💾 **媒体库路径**：在磁盘管理页选择本机目录，后台扫描其中的图片、视频、音频和文档，支持实时状态和中止扫描
 - 🔄 **扫描同步**：一键扫描存储目录，同步文件系统变更到数据库
 
 ## 技术栈
@@ -25,18 +26,20 @@
 ### 1. 安装依赖
 
 ```bash
-pip3 install -r requirements.txt
+python3 -m pip install -r requirements.txt
 ```
 
 ### 2. 启动服务
 
 ```bash
 ./run.sh
+# 首次运行或依赖变更时可使用
+./run.sh --install
 # 或
 python3 app.py
 ```
 
-服务默认运行在 `http://0.0.0.0:5000`。
+`./run.sh` 默认监听 `0.0.0.0:5000`，适合局域网访问；`python3 app.py` 默认只监听 `127.0.0.1:5000`。
 
 ### 3. 登录
 
@@ -56,6 +59,9 @@ python3 app.py
 | `HIVE_SECRET_KEY` | Flask 安全密钥 | `dev-secret-key-change-in-production` |
 | `HIVE_ADMIN_USER` | 默认管理员用户名 | `admin` |
 | `HIVE_ADMIN_PASS` | 默认管理员密码 | `admin123` |
+| `HIVE_HOST` | 服务监听地址 | `127.0.0.1` |
+| `HIVE_PORT` | 服务监听端口 | `5000` |
+| `HIVE_DEBUG` | 是否开启 Flask debug 模式 | 关闭 |
 
 > 旧的 `NAS_SECRET_KEY` / `NAS_ADMIN_USER` / `NAS_ADMIN_PASS` 仍向后兼容。
 
@@ -87,6 +93,8 @@ nas_admin/
 - 当前使用 Flask 内置开发服务器，建议在生产环境使用 Gunicorn 等 WSGI 服务器
 - 大文件上传受 `MAX_CONTENT_LENGTH` 配置限制（默认 10GB）
 - 视频缩略图需要系统安装 ffmpeg
+- 浏览器不支持的视频编码会尝试使用 ffmpeg 转码播放
+- 媒体库路径只会建立索引和用于预览，不会在移除媒体库时删除原始文件；移除媒体库会中止相关扫描并删除该路径的索引结果；扫描会跳过无法识别的 `other` 类型文件
 - 请妥善保管管理员账号，建议通过反向代理添加 HTTPS
 
 ## 许可证
